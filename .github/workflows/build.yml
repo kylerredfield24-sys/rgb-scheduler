@@ -55,6 +55,17 @@ jobs:
             --hidden-import pywinauto.controls.uia_controls --hidden-import pywinauto.controls.uiawrapper `
             rgb_scheduler.py
 
+      - name: Self-test the built .exe
+        if: steps.ver.outputs.exists == 'false'
+        timeout-minutes: 3
+        shell: pwsh
+        env:
+          APPDATA: ${{ runner.temp }}\appdata2
+        run: |
+          $p = Start-Process -FilePath "dist\RGB-Scheduler.exe" -ArgumentList "--selftest" -Wait -PassThru
+          Get-Content "$env:APPDATA\RGBScheduler\selftest.txt" -ErrorAction SilentlyContinue
+          if ($p.ExitCode -ne 0) { throw "The .exe self-test failed (exit $($p.ExitCode))" }
+
       - name: Publish release
         if: steps.ver.outputs.exists == 'false'
         shell: pwsh

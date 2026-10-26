@@ -52,7 +52,7 @@ else:  # lets the image-finding code be tested off Windows
     user32 = gdi32 = kernel32 = None
 
 APP_NAME = "RGB Scheduler"
-APP_VERSION = "1.0"                               # 1.9 -> 2.0, never 1.10
+APP_VERSION = "1.1"                               # 1.9 -> 2.0, never 1.10
 GITHUB_REPO = "kylerredfield24-sys/rgb-scheduler"  # where updates are published (Releases)
 UPDATE_ASSET = "RGB-Scheduler.exe"
 TASK_NAME = "RGB Scheduler"
@@ -182,8 +182,32 @@ def ensure_launch_task():
     return _register_task(LAUNCH_TASK, "", at_logon=False, multiple="Parallel")
 
 
+def launch_task_points_here():
+    """True if the saved "open as admin" task starts THIS copy of the app. (If you download
+    a new copy somewhere else, the old task would start the old copy, or nothing.)"""
+    try:
+        r = subprocess.run(["schtasks", "/Query", "/TN", LAUNCH_TASK, "/XML"],
+                           capture_output=True, creationflags=NO_WINDOW)
+        if r.returncode != 0:
+            return False
+        raw = r.stdout
+        text = raw.decode("utf-16", errors="ignore") if b"\x00" in raw[:200] \
+            else raw.decode("utf-8", errors="ignore")
+        m = re.search(r"<Command>(.*?)</Command>", text, re.S)
+        if not m:
+            return False
+        from xml.sax.saxutils import unescape
+        prog, _ = launch_command()
+        return os.path.normcase(os.path.abspath(unescape(m.group(1).strip()))) == \
+            os.path.normcase(os.path.abspath(prog))
+    except Exception:
+        return False
+
+
 def open_through_task():
     """(Not admin) Ask Task Scheduler to open the app as admin. No Yes/No prompt."""
+    if not launch_task_points_here():
+        return False
     try:
         r = subprocess.run(["schtasks", "/Run", "/TN", LAUNCH_TASK],
                            capture_output=True, creationflags=NO_WINDOW)
@@ -3033,11 +3057,24 @@ def selftest():
         app.run()
         errs = getattr(app, "selftest_errors", ["didn't finish"])
     except Exception:
-        traceback.print_exc()
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            with open(os.path.join(CONFIG_DIR, "selftest.txt"), "w", encoding="utf-8") as f:
+                f.write(traceback.format_exc())
+            if sys.stderr:
+                traceback.print_exc()
+        except Exception:
+            pass
         sys.exit(1)
-    for e in errs:
-        print("SELFTEST ERROR:", repr(e))
-    print("selftest", "FAILED" if errs else "passed")
+    lines = [f"SELFTEST ERROR: {e!r}" for e in errs] + [f"selftest {'FAILED' if errs else 'passed'}"]
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(os.path.join(CONFIG_DIR, "selftest.txt"), "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        if sys.stdout:
+            print("\n".join(lines))
+    except Exception:
+        pass
     sys.exit(1 if errs else 0)
 
 
