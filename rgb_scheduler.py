@@ -81,7 +81,7 @@ DEFAULTS = {
     "asr_path": "",
     "header_name": "Addressable",
     "apply_name": "Apply All",
-    "close_after": True,
+    "close_after": False,     # keep Polychrome running hidden: faster, no popups
     "apply_on_launch": True,
     "start_with_windows": False,
     "allow_visible_clicks": False,
@@ -243,6 +243,9 @@ def load_config():
     tr = cfg.get("toggle_rel")
     if tr and not (1.05 <= tr[1] <= 1.65):
         cfg.pop("toggle_rel", None)
+    if not cfg.get("_v4"):
+        cfg["close_after"] = False
+        cfg["_v4"] = True
     if not cfg.get("_v3"):
         cfg["allow_visible_clicks"] = False    # real clicks move your mouse: off unless you turn it on
         cfg["click_method"] = "auto"
@@ -1073,7 +1076,10 @@ def launch_asr(path):
     si = subprocess.STARTUPINFO()
     si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     si.wShowWindow = 4  # SW_SHOWNOACTIVATE
-    subprocess.Popen([path], cwd=os.path.dirname(path), startupinfo=si)
+    # CREATE_NO_WINDOW: ASRRGBLED starts as a command-prompt program; this stops that
+    # black window from ever appearing (it does nothing to normal windows)
+    return subprocess.Popen([path], cwd=os.path.dirname(path), startupinfo=si,
+                            creationflags=NO_WINDOW).pid
 
 
 class WindowHider:
@@ -1397,7 +1403,7 @@ class AsrSession:
             if not path or not os.path.exists(path):
                 raise RuntimeError("Can't find ASRRGBLED. Set its path in Settings.")
             self.cfg["asr_path"] = path
-            launch_asr(path)
+            self.hider.names[launch_asr(path)] = True   # hide its windows from the very first one
             self.we_opened = True
             deadline = time.time() + 40
             while time.time() < deadline:
@@ -1461,10 +1467,13 @@ class AsrSession:
             self._save_failure()
         if exc_type is not None and self.we_opened:
             kill_asr(self.cfg)                   # never leave a half-used copy around
-        elif self.we_opened and self.cfg.get("close_after", True):
-            self._close_for_real()
-        elif self.state:
-            unhide_window(self.hwnd, self.state, minimize=self.we_opened)
+        elif self.cfg.get("close_after", False):
+            if self.we_opened:
+                self._close_for_real()
+            elif self.state:
+                unhide_window(self.hwnd, self.state)
+        # otherwise keep Polychrome running, invisible, so the next change is fast and
+        # there's no loading screen / popup at all
         return False
 
     def _save_failure(self):
@@ -1762,6 +1771,95 @@ class AsrSession:
             vals.append(int(round(min(255, max(0, v)))))
         return tuple(vals)
 
+    def _debug_picture(self, name, sl=None, shade=None, wheel=None, note=""):
+        """Save what the app saw, with what it found marked on it (for troubleshooting)."""
+        try:
+            from PIL import ImageDraw
+            img = capture_window(self.hwnd).convert("RGB")
+            d = ImageDraw.Draw(img)
+            if wheel:
+                r = wheel["r"]
+                d.ellipse([wheel["cx"] - r, wheel["cy"] - r, wheel["cx"] + r, wheel["cy"] + r],
+                          outline=(255, 0, 255), width=2)
+            if shade:
+                d.rectangle(shade["box"], outline=(0, 255, 255), width=2)
+            if sl:
+                for x in sl["x"]:
+                    d.line([x, sl["top"], x, sl["bottom"]], fill=(255, 255, 0), width=1)
+                    k = find_knob(img, x, sl["top"], sl["bottom"])
+                    if k is not None:
+                        d.ellipse([x - 8, k - 8, x + 8, k + 8], outline=(255, 128, 0), width=2)
+            if note:
+                d.text((8, 8), note, fill=(255, 255, 255))
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            img.save(os.path.join(CONFIG_DIR, name))
+        except Exception:
+            pass
+
+    def calibrate_sliders(self, sl, shade, method, wheel=None):
+        """Learn where 0 and 255 are on the sliders: pick black, then white, and see where
+        the knobs land. Saved, so it only happens once."""
+        import numpy as np
+        size = list(capture_window(self.hwnd).size)
+        cal = self.cfg.get("slider_cal")
+        if cal and cal.get("size") == size and len(cal.get("x", [])) == 3 and \
+                all(abs(a - b) <= 3 for a, b in zip(cal["x"], sl["x"])):
+            return cal
+        x0, y0, x1, y1 = shade["box"]
+        w, h = x1 - x0, y1 - y0
+        # a little inside the corners so the clicks can't miss the box
+        spots = {"y0": ((x0 + x1) // 2, y1 - max(3, h // 30)),
+                 "y255": (x0 + max(3, w // 30), y0 + max(3, h // 30))}
+        got = {}
+        for key, pt in spots.items():
+            self.click(*pt, method=method)
+            time.sleep(0.2)
+            img = capture_window(self.hwnd)
+            ys = [find_knob(img, x, sl["top"], sl["bottom"]) for x in sl["x"]]
+            if None in ys:
+                why = "couldn't find the slider knobs"
+            elif max(ys) - min(ys) > 14:
+                why = f"knobs didn't line up after picking {'black' if key == 'y0' else 'white'} {ys}"
+            else:
+                got[key] = float(np.median(ys))
+                continue
+            self.log(f"Color readout: {why}. Saved color_check.png.")
+            self._debug_picture("color_check.png", sl, shade, wheel, why)
+            return None
+        if got["y0"] - got["y255"] < 40:
+            why = f"black and white looked the same ({got})"
+            self.log(f"Color readout: {why}. Saved color_check.png.")
+            self._debug_picture("color_check.png", sl, shade, wheel, why)
+            return None
+        cal = {"size": size, "x": sl["x"], "y0": got["y0"], "y255": got["y255"]}
+        self.cfg["slider_cal"] = cal
+        self.log("Learned the R/G/B readout.")
+        return cal
+
+    def _ring_click_at_angle(self, wheel, ang, rr, method):
+        pt = int(wheel["cx"] + rr * math.cos(ang)), int(wheel["cy"] - rr * math.sin(ang))
+        self.click(*pt, method=method)
+        return pt
+
+    # ---------------- reading the exact color back from the R/G/B slider knobs
+    def _sliders(self, img, wheel):
+        sl = detect_sliders(img, wheel) if wheel else None
+        if not sl and layout_fits(img.size):
+            sl = layout_sliders(img.size)
+        return sl
+
+    def read_rgb(self, sl, cal):
+        """The color Polychrome is set to right now, read from where the 3 knobs sit."""
+        img = capture_window(self.hwnd)
+        vals = []
+        for x in sl["x"]:
+            y = find_knob(img, x, sl["top"], sl["bottom"])
+            if y is None:
+                return None
+            v = (cal["y0"] - y) / max(cal["y0"] - cal["y255"], 1) * 255
+            vals.append(int(round(min(255, max(0, v)))))
+        return tuple(vals)
+
     def calibrate_sliders(self, sl, shade, method):
         """Learn where 0 and 255 are on the sliders: pick pure black, then pure white,
         and see where the knobs land. Saved, so it only happens once."""
@@ -1803,7 +1901,10 @@ class AsrSession:
             self.log("Using ASRRGBLED's known layout.")
         method = self.learn_click_method(img, wheel, shade)
         sl = self._sliders(img, wheel) if shade else None
-        cal = self.calibrate_sliders(sl, shade, method) if sl else None
+        cal = self.calibrate_sliders(sl, shade, method, wheel) if sl else None
+        if not sl:
+            self.log("Color readout: couldn't find the R/G/B sliders. Saved color_check.png.")
+            self._debug_picture("color_check.png", None, shade, wheel, "no sliders found")
 
         target = hue_of_rgb(r, g, b)
         pt = self.ring_point(capture_window(self.hwnd), wheel, target, source)
@@ -1815,7 +1916,7 @@ class AsrSession:
         spot = shade2["point_for_rgb"](r, g, b)
         self.click(*spot, method=method)
         if not cal:
-            self.log("Can't read the exact color back, so it may be a little off.")
+            self._debug_picture("last_color.png", sl, shade2, wheel, f"wanted {r},{g},{b} (no readout)")
             return
 
         # ---- fine-tune until the sliders say exactly the wanted color
@@ -1854,6 +1955,7 @@ class AsrSession:
             got = self.read_rgb(sl, cal)
         if got:
             self.log(f"Set R{got[0]} G{got[1]} B{got[2]} (wanted R{r} G{g} B{b}).")
+        self._debug_picture("last_color.png", sl, shade2, wheel, f"wanted {r},{g},{b} got {got}")
 
     def toggle_spot(self, img, wheel):
         """Where the on/off switch is. Remembered once seen (it can't be seen by color when off)."""
@@ -2447,7 +2549,9 @@ class App:
         e.pack(side="left", fill="x", expand=True)
         e.bind("<FocusOut>", lambda _e: self._save_names())
         ctk.CTkButton(row, text="Browse", width=72, command=self._browse, **btn).pack(side="left", padx=(6, 0))
-        self._switch(pc, "Close Polychrome when done", "close_after")
+        self._switch(pc, "Close Polychrome after each change (slower, shows its loading screen)", "close_after")
+        ctk.CTkButton(pc, text="Show Polychrome", width=140, command=self.show_polychrome,
+                      **btn).pack(anchor="w", pady=(6, 0))
 
         # Troubleshooting
         tr = self._section(page, "Troubleshooting",
@@ -2887,6 +2991,26 @@ class App:
                 self.run_lock.release()
         threading.Thread(target=job, daemon=True).start()
 
+    def show_polychrome(self):
+        """Bring the hidden Polychrome window back so you can use it yourself."""
+        def job():
+            if not self.run_lock.acquire(timeout=120):
+                return
+            try:
+                hwnd = find_asr_hwnd(self.cfg)
+                if not hwnd:
+                    path = self.cfg.get("asr_path") or find_asr_exe()
+                    if path:
+                        subprocess.Popen([path], cwd=os.path.dirname(path), creationflags=NO_WINDOW)
+                    return
+                user32.SetWindowLongW(hwnd, -20, ORIGINAL_EX.get(hwnd, user32.GetWindowLongW(hwnd, -20) & ~0x80080))
+                user32.ShowWindow(hwnd, 9)                     # SW_RESTORE
+                user32.SetWindowPos(hwnd, 0, 100, 100, 0, 0, SWP_NOSIZE | SWP_NOZORDER)
+                user32.SetForegroundWindow(hwnd)
+            finally:
+                self.run_lock.release()
+        threading.Thread(target=job, daemon=True).start()
+
     def _too_slow(self):
         """If setting a color gets stuck, close ASRRGBLED so the stuck step fails and it can retry."""
         self.log("ASRRGBLED got stuck, closing it...")
@@ -2998,6 +3122,11 @@ class App:
 
     def quit(self):
         self.quitting = True
+        if not self.cfg.get("close_after", False):
+            try:
+                kill_asr(self.cfg)          # don't leave an invisible Polychrome behind
+            except Exception:
+                pass
         try:
             self.tray.stop()
         except Exception:
