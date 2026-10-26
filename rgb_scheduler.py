@@ -52,7 +52,7 @@ else:  # lets the image-finding code be tested off Windows
     user32 = gdi32 = kernel32 = None
 
 APP_NAME = "RGB Scheduler"
-APP_VERSION = "1.1"                               # 1.9 -> 2.0, never 1.10
+APP_VERSION = "1.2"                               # 1.9 -> 2.0, never 1.10
 GITHUB_REPO = "kylerredfield24-sys/rgb-scheduler"  # where updates are published (Releases)
 UPDATE_ASSET = "RGB-Scheduler.exe"
 TASK_NAME = "RGB Scheduler"
@@ -1087,8 +1087,9 @@ class WindowHider:
     Realtek popup, anything else) see-through the instant Windows creates it, with the
     open animation turned off, so nothing flashes on screen."""
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, consoles_only=False):
         self.cfg = cfg
+        self.consoles_only = consoles_only
         self.thread_id = None
         self.names = {}
         self.ready = threading.Event()
@@ -1123,7 +1124,32 @@ class WindowHider:
         if _class_of(hwnd) not in ("ConsoleWindowClass", "CASCADIA_HOSTING_WINDOW_CLASS"):
             return False
         t = _title_of(hwnd).lower()
-        return any(k in t for k in ("asrock", "asrrgb", "polychrome", "\\asr", "rgbled"))
+        return any(k in t for k in ("asrock", "asrrgb", "polychrome", "\\asr", "rgbled", "asrisp"))
+
+    @staticmethod
+    def _hide_console(hwnd):
+        """Command-prompt windows ignore see-through, so hide them outright. The program
+        inside keeps running. (Clicking into one would also pause it.)"""
+        user32.ShowWindow(hwnd, 0)                          # SW_HIDE
+
+    def _poll_consoles(self):
+        """Backup for the event hook: sweep for ASRock command prompts many times a second."""
+        found = []
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def cb(hwnd, _):
+            if user32.IsWindowVisible(hwnd) and self._asr_console(hwnd):
+                found.append(hwnd)
+            return True
+        while self.thread_id or not self.ready.is_set():
+            found.clear()
+            try:
+                user32.EnumWindows(cb, 0)
+                for h in found:
+                    self._hide_console(h)
+            except Exception:
+                pass
+            time.sleep(0.03)
 
     def _on_event(self, _hook, _event, hwnd, id_object, id_child, _thread, _time):
         try:
@@ -1133,7 +1159,12 @@ class WindowHider:
                 return
             pid = wintypes.DWORD()
             user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-            if (self._is_asr(pid.value) or self._asr_console(hwnd)
+            if self._asr_console(hwnd):
+                self._hide_console(hwnd)
+                return
+            if self.consoles_only:
+                return
+            if (self._is_asr(pid.value)
                     or (_class_of(hwnd) == "#32770" and "realtek" in _title_of(hwnd).lower())):
                 off = ctypes.c_int(1)
                 ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 3, ctypes.byref(off), 4)  # no open animation
@@ -1166,6 +1197,7 @@ class WindowHider:
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
         self.ready.wait(2)
+        threading.Thread(target=self._poll_consoles, daemon=True).start()
         return self
 
     def stop(self):
@@ -2355,6 +2387,7 @@ class App:
         if selftest:
             self._selftest()
             return
+        self.console_hider = WindowHider(self.cfg, consoles_only=True).start()   # ASRock command prompts, always
         threading.Thread(target=self._scheduler_loop, daemon=True).start()
         threading.Thread(target=self._listen_for_show, daemon=True).start()
         self.root.after(8000, self._auto_update_tick)
