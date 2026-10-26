@@ -28,6 +28,7 @@ jobs:
           "version=$v" >> $env:GITHUB_OUTPUT
           gh release view "v$v" *> $null
           if ($LASTEXITCODE -eq 0) { "exists=true" >> $env:GITHUB_OUTPUT } else { "exists=false" >> $env:GITHUB_OUTPUT }
+          exit 0   # "no release yet" isn't an error
         env:
           GH_TOKEN: ${{ github.token }}
 
