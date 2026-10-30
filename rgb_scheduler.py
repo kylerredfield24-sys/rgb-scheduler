@@ -52,7 +52,7 @@ else:  # lets the image-finding code be tested off Windows
     user32 = gdi32 = kernel32 = None
 
 APP_NAME = "RGB Scheduler"
-APP_VERSION = "1.2"                               # 1.9 -> 2.0, never 1.10
+APP_VERSION = "1.3"                               # 1.9 -> 2.0, never 1.10
 GITHUB_REPO = "kylerredfield24-sys/rgb-scheduler"  # where updates are published (Releases)
 UPDATE_ASSET = "RGB-Scheduler.exe"
 TASK_NAME = "RGB Scheduler"
@@ -132,6 +132,22 @@ def relaunch_as_admin():
     return ctypes.windll.shell32.ShellExecuteW(None, "runas", prog, params, None, 1) > 32
 
 
+def keep_awake_in_background():
+    """Windows slows down apps that are minimized or when the PC is idle ("Efficiency mode" /
+    power throttling). Opt this app out so the schedule always fires on time. Doesn't keep the PC awake."""
+    try:
+        class PPTS(ctypes.Structure):
+            _fields_ = [("Version", wintypes.ULONG), ("ControlMask", wintypes.ULONG), ("StateMask", wintypes.ULONG)]
+        k = ctypes.windll.kernel32
+        h = k.GetCurrentProcess()
+        for mask in (0x1, 0x4):              # execution speed, timer resolution
+            st = PPTS(1, mask, 0)            # control it, and turn throttling OFF
+            k.SetProcessInformation(h, 4, ctypes.byref(st), ctypes.sizeof(st))   # 4 = ProcessPowerThrottling
+        k.SetPriorityClass(h, 0x20)          # NORMAL_PRIORITY_CLASS (never "efficiency")
+    except Exception:
+        pass
+
+
 LAUNCH_TASK = "RGB Scheduler (open as admin)"
 SHOW_EVENT = "Local\\RGBSchedulerShow"
 NO_WINDOW = 0x08000000
@@ -161,7 +177,10 @@ def _register_task(name, args, at_logon, multiple):
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
-    <Priority>5</Priority>
+    <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <Priority>4</Priority>
     <Enabled>true</Enabled>
   </Settings>
   <Actions Context="Author">
@@ -2368,7 +2387,7 @@ class App:
         self.root.geometry("480x740")
         self.root.minsize(470, 600)
         self.root.after(250, lambda: self.root.iconbitmap(ICON_PATH))
-        self.root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
+        self.root.protocol("WM_DELETE_WINDOW", self.quit)   # X = close the app
         self.root.bind("<Unmap>", self._on_unmap)
 
         self._build_ui()
@@ -2388,7 +2407,14 @@ class App:
             self._selftest()
             return
         self.console_hider = WindowHider(self.cfg, consoles_only=True).start()   # ASRock command prompts, always
-        threading.Thread(target=self._scheduler_loop, daemon=True).start()
+        keep_awake_in_background()
+        if self.cfg.get("start_with_windows"):
+            try:
+                set_startup(True)        # refresh the startup task with the never-stop-when-idle settings
+            except Exception:
+                pass
+        self._start_scheduler()
+        self.root.after(60_000, self._watchdog)
         threading.Thread(target=self._listen_for_show, daemon=True).start()
         self.root.after(8000, self._auto_update_tick)
         if start_minimized:
@@ -3065,6 +3091,20 @@ class App:
         self._save_names()
         threading.Thread(target=lambda: self._com_job(job), daemon=True).start()
 
+    def _start_scheduler(self):
+        self.sched_thread = threading.Thread(target=self._scheduler_loop, daemon=True)
+        self.sched_thread.start()
+
+    def _watchdog(self):
+        """Every minute: if the schedule loop ever stopped (minimized, idle, after sleep), start it again."""
+        if self.quitting:
+            return
+        if not self.sched_thread.is_alive():
+            self.log("Schedule loop had stopped. Started it again.")
+            self._start_scheduler()
+        self.wake.set()                      # also re-check the color right away (e.g. after the PC wakes up)
+        self.root.after(60_000, self._watchdog)
+
     def _scheduler_loop(self):
         """Every couple of seconds: if the fans aren't on the schedule's color, fix them."""
         import comtypes
@@ -3121,17 +3161,17 @@ class App:
         self._toggle_enabled()
 
     def _on_unmap(self, event):
-        if event.widget is self.root and self.root.state() == "iconic":
-            self.root.after(10, self.root.withdraw)
+        if event.widget is self.root and self.root.state() == "iconic" and not self.quitting:
+            self.root.after(10, self.hide_to_tray)
 
     def hide_to_tray(self):
-        """X just hides the window. The schedule keeps running; Quit from the tray stops it."""
+        """Minimize = hide to the tray. The schedule keeps running. (X closes the app.)"""
         self.root.withdraw()
         if not self.cfg.get("_told_tray"):
             self.cfg["_told_tray"] = True
             save_config(self.cfg)
             try:
-                self.tray.notify("Still running in the tray (^ by the clock). Right-click it and pick Quit to stop.",
+                self.tray.notify("Still running in the tray (^ by the clock). Click X or Quit to close it.",
                                  APP_NAME)
             except Exception:
                 pass
